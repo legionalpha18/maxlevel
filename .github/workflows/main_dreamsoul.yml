@@ -582,9 +582,26 @@ jobs:
           echo "Building with $N parallel jobs..."
           # -k 0: keep going after errors so ALL failed files appear in the log, not just the first
           # Ninja prints [X/Y] progress per file without --verbose
-          cmake --build build --target install --parallel "$N" -- -k 0
+          set +e
+          cmake --build build --target install --parallel "$N" -- -k 0 2>&1 | tee build/build.log
+          BUILD_RC=${PIPESTATUS[0]}
+          set -e
+          if [ "$BUILD_RC" -ne 0 ]; then
+            echo "---- Build error summary (last 200 FAILED/error lines) ----"
+            grep -nE "^FAILED:|error C[0-9]+:| error: |fatal error" build/build.log | tail -200 || true
+            exit "$BUILD_RC"
+          fi
           echo "---- Installed toolchain ----"
           ls -R "$GITHUB_WORKSPACE/ollvm-dist/bin" | head -50
+
+      - name: Upload build log (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build/build.log
+          if-no-files-found: warn
+          retention-days: 7
 
       # ---------------------------------------------------------------
       # 8b. Smoke-test: compile a tiny AArch64 function with every
