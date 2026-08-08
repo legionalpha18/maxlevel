@@ -10,7 +10,7 @@ using namespace llvm;
 
 // Returns false for constants the optimizer or ABI requires to stay literal
 static bool shouldEncrypt(ConstantInt *CI) {
-  unsigned Bits = CI->getType()->getBitWidth();
+  unsigned Bits = cast<IntegerType>(CI->getType())->getBitWidth();
   if (Bits != 8 && Bits != 16 && Bits != 32 && Bits != 64)
     return false;
   if (CI->isZero() || CI->isOne() || CI->isAllOnesValue())
@@ -55,7 +55,7 @@ PreservedAnalyses ConstantEncryption::run(Function &F,
     return PreservedAnalyses::all();
 
   for (auto &T : Tasks) {
-    Type    *Ty   = T.C->getType();
+    IntegerType *Ty   = cast<IntegerType>(T.C->getType());
     unsigned Bits = Ty->getBitWidth();
     uint64_t Mask = (Bits < 64) ? ((1ULL << Bits) - 1) : ~0ULL;
     uint64_t Orig = T.C->getZExtValue() & Mask;
