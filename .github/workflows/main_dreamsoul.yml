@@ -1,0 +1,664 @@
+# =====================================================================
+# Build DreamSoule/ollvm17 (LLVM 17.0.6 + obfuscation passes) for Windows
+# Output: a portable clang+lld toolchain drop-in for Android NDK r26
+#
+# Obfuscation flags you can pass to clang (-mllvm -<flag>):
+#   -mllvm -fla -mllvm -bcf -mllvm -bcf_prob=80 -mllvm -bcf_loop=3
+#   -mllvm -sobf -mllvm -icall -mllvm -ibr -mllvm -igv
+#   -mllvm -sub -mllvm -sub_loop=3 -mllvm -split -mllvm -split_num=5
+#   -mllvm -fncmd     (enable function-name control: e.g. function_fla_bcf_())
+#   -mllvm -mba       (Linear MBA -- math obfuscation via rbit/eor/orr chains)
+#   -mllvm -alias     (Alias access -- pointer maze obfuscation)
+#   -mllvm -junkcode  (Anti-decompiler junk code blocks)
+#   -mllvm -bcf2      (Enhanced bogus control flow v2)
+#   -mllvm -mergefunc (Merge functions obfuscation)
+#   -mllvm -antidbg   (Anti-Debugging — blocks Frida/IDA dynamic attach)
+#   -mllvm -funcwrap  (Function Wrapper — hides call targets)
+#   -mllvm -constenc    (Constant Encryption — Hikari-style XOR key globals hide magic numbers)
+#   -mllvm -aarch64-obfu (AArch64 backend obfuscation -- requires asm("backend-obfu") marker)
+#   Full: __attribute__((annotate("fla bcf sub mba linearmba aliasaccess junkcode boguscfg2 mergefunction antidbg funcwrap constenc")))
+# ====================================================================
+name: Build OLLVM17 (Windows, for Android NDK r26)
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+# Building clang+lld is heavy; raise the job cap. GHA max is 360 min.
+# Typical run time on windows-latest is ~1.5 to 3 hours.
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    steps:
+      # ---------------------------------------------------------------
+      # 0. Checkout (so the workflow file itself is in the workspace)
+      # ---------------------------------------------------------------
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ---------------------------------------------------------------
+      # 1. Set up MSVC developer environment (cl.exe + env)
+      # ---------------------------------------------------------------
+      - name: Set up MSVC dev cmd
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      # ---------------------------------------------------------------
+      # 2. Make sure Ninja is available (GHA windows images ship it,
+      #    this is just a safety net)
+      # ---------------------------------------------------------------
+      - name: Ensure Ninja
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v ninja >/dev/null 2>&1; then
+            choco install ninja -y --no-progress
+          fi
+          ninja --version || true
+          cmake --version
+
+      # ---------------------------------------------------------------
+      # 3. Download & extract official LLVM 17.0.6 monorepo source
+      # ---------------------------------------------------------------
+      - name: Download LLVM 17.0.6 source
+        shell: bash
+        run: |
+          set -euo pipefail
+          URL="https://github.com/llvm/llvm-project/releases/download/llvmorg-17.0.6/llvm-project-17.0.6.src.tar.xz"
+          curl -L --fail -o llvm.src.tar.xz "$URL"
+          # Some clang test fixtures contain symlinks to files that don't
+          # exist in the tarball; on Windows tar cannot create those and
+          # exits non-zero. The test fixtures are NOT needed for the build
+          # (tests are disabled below), so exclude them outright and strip
+          # the warning noise. We then verify the source dirs we actually
+          # use are present.
+          tar -xJf llvm.src.tar.xz \
+            --exclude='llvm-project-17.0.6.src/clang/test/Driver/Inputs/basic_cross_linux_tree' \
+            --exclude='llvm-project-17.0.6.src/clang/test/Driver/Inputs/multilib_32bit_linux_tree' \
+            --exclude='llvm-project-17.0.6.src/clang/test/Driver/Inputs/multilib_64bit_linux_tree' \
+            || true
+          # Verify the pieces we actually build from are intact.
+          test -d llvm-project-17.0.6.src/llvm          || { echo "MISSING llvm/"; exit 1; }
+          test -d llvm-project-17.0.6.src/clang         || { echo "MISSING clang/"; exit 1; }
+          test -d llvm-project-17.0.6.src/lld           || { echo "MISSING lld/"; exit 1; }
+          test -f llvm-project-17.0.6.src/llvm/CMakeLists.txt \
+            || { echo "MISSING llvm/CMakeLists.txt"; exit 1; }
+          echo "OK: LLVM source tree extracted (symlink test fixtures skipped)"
+          ls -d llvm-project-17.0.6.src/llvm
+
+      # ---------------------------------------------------------------
+      # 4. Clone DreamSoule/ollvm17 (already-patched PassBuilder.cpp,
+      #    CMakeLists.txt and the Obfuscation/ folder)
+      # ---------------------------------------------------------------
+      - name: Clone DreamSoule/ollvm17
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/DreamSoule/ollvm17 ollvm17
+          cd ollvm17 && git log --oneline -1 && cd ..
+          ls ollvm17/llvm-project/llvm/lib/Passes/Obfuscation | head
+
+      # ---------------------------------------------------------------
+      # 5. Overlay the obfuscation files onto the official source tree.
+      #    NOTE: do NOT manually edit PassBuilder.cpp or CMakeLists.txt;
+      #    the fork ships them already patched. Just copy them in.
+      # ---------------------------------------------------------------
+      - name: Overlay obfuscation files
+        shell: bash
+        run: |
+          set -euo pipefail
+          SRC="ollvm17/llvm-project/llvm/lib/Passes"
+          DST="llvm-project-17.0.6.src/llvm/lib/Passes"
+          cp -rf "$SRC"/. "$DST"/
+          echo "---- Obfuscation folder now in place ----"
+          ls "$DST/Obfuscation"
+          echo "---- Sanity: PassBuilder.cpp contains the callback ----"
+          grep -c "registerPipelineStartEPCallback" "$DST/PassBuilder.cpp" || true
+          grep -c "Obfuscation/BogusControlFlow.h"     "$DST/PassBuilder.cpp" || true
+          echo "---- Sanity: CMakeLists lists Obfuscation sources ----"
+          grep -c "Obfuscation/StringEncryption.cpp"   "$DST/CMakeLists.txt" || true
+
+      # ---------------------------------------------------------------
+      # 5b. Overlay Polaris IR-level passes (LinearMBA + AliasAccess)
+      #     These come from the workspace overlay/ directory and
+      #     are copied on top of the DreamSoule overlay.
+      # ---------------------------------------------------------------
+      - name: Overlay Polaris IR passes
+        shell: bash
+        run: |
+          set -euo pipefail
+          DST="llvm-project-17.0.6.src"
+
+          # Copy Passes (IR-level obfuscation files)
+          SRC="$GITHUB_WORKSPACE/overlay/llvm-project/llvm/lib/Passes"
+          cp -rf "$SRC"/. "$DST/llvm/lib/Passes"/
+          echo "---- Polaris IR pass files now in place ----"
+          ls "$DST/llvm/lib/Passes/Obfuscation/JunkCodeGen.cpp" "$DST/llvm/lib/Passes/Obfuscation/BogusControlFlow2.cpp" "$DST/llvm/lib/Passes/Obfuscation/MergeFunction.cpp"
+
+          # Copy AArch64 backend obfuscation file
+          cp -f "$GITHUB_WORKSPACE/overlay/llvm-project/llvm/lib/Target/AArch64/AArch64RubbishCode.cpp" "$DST/llvm/lib/Target/AArch64/"
+          echo "---- AArch64 backend obfuscation file now in place ----"
+          ls "$DST/llvm/lib/Target/AArch64/AArch64RubbishCode.cpp"
+
+          echo "---- Sanity: CMakeLists lists new IR sources ----"
+          grep -c "Obfuscation/JunkCodeGen.cpp" "$DST/llvm/lib/Passes/CMakeLists.txt" || true
+          grep -c "Obfuscation/MergeFunction.cpp" "$DST/llvm/lib/Passes/CMakeLists.txt" || true
+
+      # ---------------------------------------------------------------
+      # 6. Apply the getBasicBlockList() private fix for 17.0.6
+      #    The obfuscation code calls Function::getBasicBlockList(),
+      #    which is private in LLVM 17. Comment the nearest preceding
+      #    `private:` so the member falls back to public visibility.
+      #    (Per DreamSoule's own patch notes.)
+      # ---------------------------------------------------------------
+      - name: Patch getBasicBlockList visibility
+        shell: bash
+        run: |
+          set -euo pipefail
+          if command -v python3 >/dev/null 2>&1; then PY=python3
+          elif command -v python >/dev/null 2>&1; then PY=python
+          else echo "No python"; exit 1; fi
+
+          FH="llvm-project-17.0.6.src/llvm/include/llvm/IR/Function.h"
+          cat > /tmp/patch_fnh.py <<'PY'
+          from pathlib import Path
+          import sys
+          p = Path(sys.argv[1])
+          text = p.read_text(encoding="utf-8", errors="replace")
+          lines = text.splitlines(True)
+          # find a line that declares getBasicBlockList
+          idx = None
+          for i, ln in enumerate(lines):
+              if "getBasicBlockList" in ln:
+                  idx = i; break
+          if idx is None:
+              print("getBasicBlockList not found; nothing to patch")
+              sys.exit(0)
+          # walk upward to nearest standalone 'private:' specifier
+          target = None
+          for j in range(idx-1, -1, -1):
+              s = lines[j].strip()
+              if s == "private:":
+                  target = j; break
+              if s == "public:" or s == "protected:":
+                  break  # already public/protected above it
+          if target is None:
+              print("No preceding private: to comment (already public)")
+              sys.exit(0)
+          lines[target] = lines[target].replace("private:", "// private: (commented for OLLVM17)")
+          p.write_text("".join(lines), encoding="utf-8")
+          print(f"Commented private: at line {target+1} (above getBasicBlockList at line {idx+1})")
+          PY
+          "$PY" /tmp/patch_fnh.py "$FH"
+          grep -n "getBasicBlockList\|private: (commented" "$FH" | head
+
+      # ---------------------------------------------------------------
+      # 6b. Patch Utils.cpp: add missing `valueEscapes` helper
+      #     This function was removed from LLVM 17 but the obfuscation
+      #     code's fixStack() still calls it. Replicate the old logic:
+      #     an instruction "escapes" if any user lives outside its BB.
+      # ---------------------------------------------------------------
+      - name: Patch Utils.cpp (valueEscapes)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if command -v python3 >/dev/null 2>&1; then PY=python3
+          elif command -v python >/dev/null 2>&1; then PY=python
+          else echo "No python"; exit 1; fi
+
+          UTILS="llvm-project-17.0.6.src/llvm/lib/Passes/Obfuscation/Utils.cpp"
+
+          cat > /tmp/patch_ve.py <<'PY'
+          from pathlib import Path
+          import sys
+          p = Path(sys.argv[1])
+          text = p.read_text(encoding="utf-8", errors="replace")
+          if text.find("static bool valueEscapes") >= 0:
+              print("valueEscapes already patched -- skipping")
+              sys.exit(0)
+          # Insert the helper right before "void llvm::fixStack(Function"
+          marker = "void llvm::fixStack(Function"
+          if marker not in text:
+              print("ERROR: fixStack signature not found in Utils.cpp")
+              sys.exit(1)
+          helper = '''static bool valueEscapes(llvm::Instruction &I) {
+            llvm::BasicBlock *BB = I.getParent();
+            for (llvm::User *U : I.users()) {
+              llvm::Instruction *UI = llvm::dyn_cast<llvm::Instruction>(U);
+              if (!UI || UI->getParent() != BB)
+                return true;
+            }
+            return false;
+          }
+
+          '''
+          text = text.replace(marker, helper + marker)
+          p.write_text(text, encoding="utf-8")
+          print("Inserted valueEscapes helper")
+          PY
+          "$PY" /tmp/patch_ve.py "$UTILS"
+          grep -c "valueEscapes" "$UTILS" || true
+          grep "static bool valueEscapes" "$UTILS"
+
+      # ---------------------------------------------------------------
+      # 6c. Patch PassBuilder.cpp: add ALL pass includes, CLI flags
+      #     and pass registrations (LinearMBA, AliasAccess, JunkCodeGen,
+      #     BogusControlFlow2, MergeFunction).
+      # ---------------------------------------------------------------
+      - name: Patch PassBuilder.cpp (all IR passes)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if command -v python3 >/dev/null 2>&1; then PY=python3
+          elif command -v python >/dev/null 2>&1; then PY=python
+          else echo "No python"; exit 1; fi
+
+          PB="llvm-project-17.0.6.src/llvm/lib/Passes/PassBuilder.cpp"
+
+          cat > /tmp/patch_pb.py <<'PYEOF'
+          from pathlib import Path
+          import sys
+          p = Path(sys.argv[1])
+          text = p.read_text(encoding="utf-8", errors="replace")
+
+          if 'Obfuscation/ConstantEncryption.h' in text:
+              print("PassBuilder already fully patched -- skipping")
+              sys.exit(0)
+
+          def must_replace(text, marker, new, label):
+              if marker not in text:
+                  print(f"ERROR: {label} marker not found in PassBuilder.cpp -- "
+                        f"upstream DreamSoule/ollvm17 source has likely changed. "
+                        f"Marker was:\n{marker}")
+                  sys.exit(1)
+              return text.replace(marker, new)
+
+          # 1. Add include lines after the Utils.h include
+          inc_marker = '#include "Obfuscation/Utils.h" // 为了控制函数名混淆开关 (bool obf_function_name_cmd;)'
+          inc_new = inc_marker + '\n#include "Obfuscation/LinearMBA.h" // Linear MBA\n#include "Obfuscation/AliasAccess.h" // Alias access\n#include "Obfuscation/JunkCodeGen.h" // Anti-decompiler junk code\n#include "Obfuscation/BogusControlFlow2.h" // Enhanced BCF\n#include "Obfuscation/MergeFunction.h" // Function merging\n#include "Obfuscation/AntiDebugging.h" // Anti-debugging\n#include "Obfuscation/FunctionWrapper.h" // Function wrapper\n#include "Obfuscation/ConstantEncryption.h" // Hikari constant encryption'
+          text = must_replace(text, inc_marker, inc_new, "include-line")
+
+          # 2. Add cl::opt flags after s_obf_fn_name_cmd
+          opt_marker = 'static cl::opt<bool> s_obf_fn_name_cmd("fncmd", cl::init(false), cl::desc("use function name control obfuscation(_ + command + _ | example: function_fla_bcf_)"));'
+          opt_new = opt_marker + '\nstatic cl::opt<bool> s_obf_mba("mba", cl::init(false), cl::desc("Linear MBA Obfuscation (math obfuscation)"));\nstatic cl::opt<bool> s_obf_alias("alias", cl::init(false), cl::desc("Alias Access Obfuscation"));\nstatic cl::opt<bool> s_obf_junkcode("junkcode", cl::init(false), cl::desc("Junk Code insertion (anti-decompiler)"));\nstatic cl::opt<bool> s_obf_bcf2("bcf2", cl::init(false), cl::desc("BogusControlFlow v2 (enhanced)"));\nstatic cl::opt<bool> s_obf_mergefunc("mergefunc", cl::init(false), cl::desc("Merge Functions obfuscation"));\nstatic cl::opt<bool> s_obf_antidbg("antidbg", cl::init(false), cl::desc("Anti-Debugging (blocks Frida/IDA attach)"));\nstatic cl::opt<bool> s_obf_funcwrap("funcwrap", cl::init(false), cl::desc("Function Wrapper (hides call targets)"));\nstatic cl::opt<bool> s_obf_constenc("constenc", cl::init(false), cl::desc("Constant Encryption (Hikari-style XOR key globals)"));'
+          text = must_replace(text, opt_marker, opt_new, "cl::opt flags")
+
+          # 3. Add Function passes in FPM (after BCF)
+          bcf_marker = 'FPM.addPass(BogusControlFlowPass(s_obf_bcf)); // 虚假控制流'
+          bcf_new = bcf_marker + '\n        FPM.addPass(polaris::LinearMBA(s_obf_mba)); // Linear MBA math obfuscation\n        FPM.addPass(JunkCodeGen(s_obf_junkcode)); // Anti-decompiler junk code\n        FPM.addPass(BogusControlFlow2(s_obf_bcf2)); // Enhanced BCF v2\n        FPM.addPass(AntiDebugging(s_obf_antidbg)); // Anti-debugging\n        FPM.addPass(ConstantEncryption(s_obf_constenc)); // Hikari constant encryption'
+          text = must_replace(text, bcf_marker, bcf_new, "FPM registration")
+
+          # 4. Add Module passes (before RewriteSymbolPass)
+          rs_marker = 'MPM.addPass(RewriteSymbolPass()); // 根据yaml信息 重命名特定symbols'
+          rs_new = 'MPM.addPass(polaris::AliasAccess(s_obf_alias)); // Alias access obfuscation\n        MPM.addPass(MergeFunction(s_obf_mergefunc)); // Merge functions\n        MPM.addPass(FunctionWrapper(s_obf_funcwrap)); // Function wrapper\n        MPM.addPass(RewriteSymbolPass()); // 根据yaml信息 重命名特定symbols'
+          text = must_replace(text, rs_marker, rs_new, "MPM registration")
+
+          p.write_text(text, encoding="utf-8")
+          print("Patched PassBuilder.cpp with all obfuscation passes")
+          PYEOF
+          "$PY" /tmp/patch_pb.py "$PB"
+          grep -c "Obfuscation/JunkCodeGen.h" "$PB" || true
+          grep -c "Obfuscation/BogusControlFlow2.h" "$PB" || true
+          grep -c "Obfuscation/FunctionWrapper.h" "$PB" || true
+          grep -c "Obfuscation/AntiDebugging.h" "$PB" || true
+          grep -c "Obfuscation/ConstantEncryption.h" "$PB" || true
+
+      # ---------------------------------------------------------------
+      # 6d. Patch AArch64 CMakeLists.txt: add AArch64RubbishCode.cpp
+      # ---------------------------------------------------------------
+      - name: Patch AArch64 CMakeLists (backend obfuscation)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if command -v python3 >/dev/null 2>&1; then PY=python3
+          elif command -v python >/dev/null 2>&1; then PY=python
+          else echo "No python"; exit 1; fi
+
+          ACM="llvm-project-17.0.6.src/llvm/lib/Target/AArch64/CMakeLists.txt"
+
+          cat > /tmp/patch_aacmake.py <<'PYEOF'
+          from pathlib import Path
+          import sys
+          p = Path(sys.argv[1])
+          text = p.read_text(encoding="utf-8", errors="replace")
+
+          if "AArch64RubbishCode.cpp" in text:
+              print("AArch64 CMakeLists already patched -- skipping")
+              sys.exit(0)
+
+          marker = "AArch64RedundantCopyElimination.cpp"
+          if marker not in text:
+              print("ERROR: marker not found in AArch64 CMakeLists.txt")
+              sys.exit(1)
+
+          newline = "  AArch64RedundantCopyElimination.cpp\n  AArch64RubbishCode.cpp"
+          text = text.replace(marker, newline)
+
+          p.write_text(text, encoding="utf-8")
+          print("Added AArch64RubbishCode.cpp to AArch64 CMakeLists")
+          PYEOF
+          "$PY" /tmp/patch_aacmake.py "$ACM"
+          grep -c "AArch64RubbishCode.cpp" "$ACM" || true
+
+      # ---------------------------------------------------------------
+      # 6e. Patch AArch64.h: add createAArch64RubbishCodePassPass
+      # ---------------------------------------------------------------
+      - name: Patch AArch64.h (backend pass declaration)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if command -v python3 >/dev/null 2>&1; then PY=python3
+          elif command -v python >/dev/null 2>&1; then PY=python
+          else echo "No python"; exit 1; fi
+
+          AH="llvm-project-17.0.6.src/llvm/lib/Target/AArch64/AArch64.h"
+
+          cat > /tmp/patch_aah.py <<'PYEOF'
+          from pathlib import Path
+          import sys, re
+          p = Path(sys.argv[1])
+          text = p.read_text(encoding="utf-8", errors="replace")
+
+          if "createAArch64RubbishCodePassPass" in text:
+              print("AArch64.h already patched -- skipping")
+              sys.exit(0)
+
+          # Try several candidate lines for the create* declaration insertion
+          create_markers = [
+              "FunctionPass *createAArch64MIPeepholeOptPass();",
+              "FunctionPass *createAArch64SLSHardeningPass();",
+              "FunctionPass *createAArch64SpeculationHardeningPass();",
+              "FunctionPass *createAArch64BranchTargetsPass();",
+              "FunctionPass *createAArch64PointerAuthPass();",
+          ]
+          create_added = False
+          for m in create_markers:
+              if m in text:
+                  text = text.replace(m, m + "\nFunctionPass *createAArch64RubbishCodePassPass();", 1)
+                  create_added = True
+                  print(f"create decl: inserted after '{m}'")
+                  break
+          if not create_added:
+              hits = list(re.finditer(r'FunctionPass \*createAArch64\w+\(\);', text))
+              if hits:
+                  last = hits[-1]
+                  text = text[:last.end()] + "\nFunctionPass *createAArch64RubbishCodePassPass();" + text[last.end():]
+                  create_added = True
+                  print("create decl: inserted via regex fallback")
+          if not create_added:
+              print("ERROR: no insertion point found for create declaration")
+              sys.exit(1)
+
+          # Try several candidate lines for the initialize* declaration insertion
+          init_markers = [
+              "void initializeAArch64RedundantCopyEliminationPass(PassRegistry&);",
+              "void initializeAArch64RedundantCopyEliminationPass(PassRegistry &);",
+              "void initializeAArch64PointerAuthPass(PassRegistry&);",
+              "void initializeAArch64PointerAuthPass(PassRegistry &);",
+              "void initializeAArch64DAGToDAGISelPass(PassRegistry&);",
+              "void initializeAArch64DAGToDAGISelPass(PassRegistry &);",
+          ]
+          init_added = False
+          for m in init_markers:
+              if m in text:
+                  text = text.replace(m, m + "\nvoid initializeAArch64RubbishCodePassPass(PassRegistry &);", 1)
+                  init_added = True
+                  print(f"init decl: inserted after '{m}'")
+                  break
+          if not init_added:
+              hits = list(re.finditer(r'void initializeAArch64\w+\(PassRegistry[^)]*\);', text))
+              if hits:
+                  last = hits[-1]
+                  text = text[:last.end()] + "\nvoid initializeAArch64RubbishCodePassPass(PassRegistry &);" + text[last.end():]
+                  init_added = True
+                  print("init decl: inserted via regex fallback")
+          if not init_added:
+              print("ERROR: no insertion point found for initialize declaration")
+              sys.exit(1)
+
+          p.write_text(text, encoding="utf-8")
+          print("Patched AArch64.h with RubbishCode declarations")
+          PYEOF
+          "$PY" /tmp/patch_aah.py "$AH"
+          grep -c "RubbishCodePassPass" "$AH" || true
+
+      # ---------------------------------------------------------------
+      # 6f. Patch AArch64TargetMachine.cpp: register backend pass
+      # ---------------------------------------------------------------
+      - name: Patch AArch64TargetMachine.cpp (backend pass registration)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if command -v python3 >/dev/null 2>&1; then PY=python3
+          elif command -v python >/dev/null 2>&1; then PY=python
+          else echo "No python"; exit 1; fi
+
+          ATM="llvm-project-17.0.6.src/llvm/lib/Target/AArch64/AArch64TargetMachine.cpp"
+
+          cat > /tmp/patch_atm.py <<'PYEOF'
+          from pathlib import Path
+          import sys, re
+          p = Path(sys.argv[1])
+          text = p.read_text(encoding="utf-8", errors="replace")
+
+          if "initializeAArch64RubbishCodePassPass" in text:
+              print("AArch64TargetMachine already patched -- skipping")
+              sys.exit(0)
+
+          # 1. Add initialize call inside LLVMInitializeAArch64Target
+          init_markers = [
+              "initializeAArch64DAGToDAGISelPass(*PR);",
+              "initializeAArch64AsmPrinterPass(*PR);",
+          ]
+          init_added = False
+          for m in init_markers:
+              if m in text:
+                  text = text.replace(m, m + "\n  initializeAArch64RubbishCodePassPass(*PR);", 1)
+                  init_added = True
+                  print(f"init call: inserted after '{m}'")
+                  break
+          if not init_added:
+              hits = list(re.finditer(r'initialize\w+\(\*PR\);', text))
+              if hits:
+                  last = hits[-1]
+                  text = text[:last.end()] + "\n  initializeAArch64RubbishCodePassPass(*PR);" + text[last.end():]
+                  init_added = True
+                  print("init call: inserted via regex fallback")
+          if not init_added:
+              print("ERROR: no initialize insertion point found")
+              sys.exit(1)
+
+          # 2. Add pass inside addPreEmitPass2
+          emit_markers = [
+              "addPass(createUnpackMachineBundles(nullptr));",
+              "addPass(createUnpackMachineBundles());",
+              "addPass(createAArch64PointerAuthPass());",
+              "addPass(createAArch64SLSHardeningPass());",
+              "addPass(createAArch64BranchTargetsPass());",
+          ]
+          emit_added = False
+          for m in emit_markers:
+              if m in text:
+                  text = text.replace(m, m + "\n  addPass(createAArch64RubbishCodePassPass());", 1)
+                  emit_added = True
+                  print(f"addPass call: inserted after '{m}'")
+                  break
+          if not emit_added:
+              # Regex fallback: find addPreEmitPass2 method body and prepend before last }
+              fn = re.search(r'(addPreEmitPass2\([^)]*\)\s*\{)(.*?)(^\})', text,
+                             re.DOTALL | re.MULTILINE)
+              if fn:
+                  insert_at = fn.start(3)
+                  text = (text[:insert_at]
+                          + "  addPass(createAArch64RubbishCodePassPass());\n"
+                          + text[insert_at:])
+                  emit_added = True
+                  print("addPass call: inserted via addPreEmitPass2 regex fallback")
+          if not emit_added:
+              print("ERROR: no addPreEmitPass2 insertion point found")
+              sys.exit(1)
+
+          p.write_text(text, encoding="utf-8")
+          print("Patched AArch64TargetMachine.cpp with RubbishCode registration")
+          PYEOF
+          "$PY" /tmp/patch_atm.py "$ATM"
+          grep -c "RubbishCodePassPass" "$ATM" || true
+
+      # ---------------------------------------------------------------
+      # 6g. Enlarge the Windows pagefile.
+      #     windows-latest runners have ~16 GB RAM and a small default
+      #     pagefile. Clang's Serialization TUs (ASTReader.cpp,
+      #     ASTWriter.cpp) can each need several GB to compile at -O2;
+      #     with several running in parallel, the box can run out of
+      #     memory and the runner just silently kills the job with no
+      #     compiler error. A bigger pagefile lets it swap instead of die.
+      # ---------------------------------------------------------------
+      - name: Enlarge pagefile
+        uses: al-cheb/configure-pagefile-action@v1.4
+        with:
+          minimum-size: 16GB
+          maximum-size: 32GB
+          disk-root: "D:"
+
+      - name: Report free memory & disk
+        shell: pwsh
+        run: |
+          Get-CimInstance Win32_OperatingSystem | Select-Object FreePhysicalMemory,TotalVisibleMemorySize
+          Get-PSDrive -PSProvider FileSystem
+
+      # ---------------------------------------------------------------
+      # 7. Configure CMake (Ninja + MSVC). Source dir = the llvm/ subdir
+      #    of the monorepo; clang and lld are pulled in as sibling
+      #    projects via LLVM_ENABLE_PROJECTS.
+      #
+      #    LLVM_PARALLEL_COMPILE_JOBS / LLVM_PARALLEL_LINK_JOBS cap how
+      #    many heavy compile/link actions Ninja runs at once, separate
+      #    from the -j/--parallel count used for the overall build. This
+      #    is the supported way to avoid OOM on memory-constrained CI
+      #    runners when compiling huge TUs like ASTReader.cpp/ASTWriter.cpp
+      #    and linking clang/lld. Tune these down further (e.g. 1) if it
+      #    still runs out of memory.
+      # ---------------------------------------------------------------
+      - name: Configure CMake
+        shell: bash
+        run: |
+          set -euo pipefail
+          export MSYS2_ARG_CONV_EXCL="*"
+          DIST="$GITHUB_WORKSPACE/ollvm-dist"
+          cmake -S llvm-project-17.0.6.src/llvm -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$DIST" \
+            -DCMAKE_C_FLAGS="/utf-8" \
+            -DCMAKE_CXX_FLAGS="/utf-8" \
+            -DLLVM_ENABLE_PROJECTS="clang;lld" \
+            -DLLVM_TARGETS_TO_BUILD="AArch64;ARM;X86" \
+            -DLLVM_ENABLE_ASSERTIONS=OFF \
+            -DLLVM_ENABLE_EH=OFF \
+            -DLLVM_ENABLE_RTTI=OFF \
+            -DLLVM_INCLUDE_TESTS=OFF \
+            -DLLVM_INCLUDE_EXAMPLES=OFF \
+            -DLLVM_INCLUDE_BENCHMARKS=OFF \
+            -DLLVM_INCLUDE_DOCS=OFF \
+            -DLLVM_INSTALL_TOOLCHAIN_ONLY=ON \
+            -DLLVM_OPTIMIZED_TABLEGEN=ON \
+            -DLLVM_ENABLE_PLUGINS=OFF \
+            -DLLVM_PARALLEL_COMPILE_JOBS=2 \
+            -DLLVM_PARALLEL_LINK_JOBS=1
+
+      # ---------------------------------------------------------------
+      # 8. Build & install (only the toolchain: clang, lld, headers)
+      # ---------------------------------------------------------------
+      - name: Build & install toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          N="${NUMBER_OF_PROCESSORS:-2}"
+          echo "Building with $N parallel jobs..."
+          # -k 0: keep going after errors so ALL failed files appear in the log, not just the first
+          # Ninja prints [X/Y] progress per file without --verbose
+          cmake --build build --target install --parallel "$N" -- -k 0
+          echo "---- Installed toolchain ----"
+          ls -R "$GITHUB_WORKSPACE/ollvm-dist/bin" | head -50
+
+      # ---------------------------------------------------------------
+      # 8b. Smoke-test: compile a tiny AArch64 function with every
+      #     obfuscation flag and confirm the output binary exists and
+      #     is a valid ELF.  Catches "build succeeded but pass crashed"
+      #     failures before the artifact is uploaded.
+      # ---------------------------------------------------------------
+      - name: Smoke-test obfuscation passes
+        shell: bash
+        run: |
+          set -euo pipefail
+          # On Windows the binary has .exe extension
+          CLANG="$GITHUB_WORKSPACE/ollvm-dist/bin/clang.exe"
+          [ -x "$CLANG" ] || CLANG="$GITHUB_WORKSPACE/ollvm-dist/bin/clang"
+          cat > /tmp/smoke.c <<'C'
+          #include <stdint.h>
+          __attribute__((annotate("fla bcf sub mba linearmba junkcode boguscfg2 antidbg funcwrap constenc")))
+          uint32_t smoke(uint32_t x) {
+            uint32_t a = x * 0x12345678u;
+            uint32_t b = a ^ 0xDEADBEEFu;
+            return b + 0xCAFEBABEu;
+          }
+          C
+          "$CLANG" --target=aarch64-linux-android21 \
+            -O2 -c /tmp/smoke.c -o /tmp/smoke.o \
+            -mllvm -fla -mllvm -bcf -mllvm -bcf_prob=60 \
+            -mllvm -sub -mllvm -mba -mllvm -junkcode \
+            -mllvm -bcf2 -mllvm -antidbg -mllvm -funcwrap \
+            -mllvm -constenc
+          # Verify output is a valid AArch64 ELF object
+          file /tmp/smoke.o | grep -i "aarch64\|arm64\|ELF" \
+            || { echo "SMOKE TEST FAILED: output is not a valid AArch64 ELF"; exit 1; }
+          echo "Smoke test PASSED"
+
+      # ---------------------------------------------------------------
+      # 9. Package the installed toolchain into a zip
+      # ---------------------------------------------------------------
+      - name: Package toolchain
+        shell: pwsh
+        run: |
+          $dst = "$env:GITHUB_WORKSPACE\ollvm-dist"
+          $zip = "$env:GITHUB_WORKSPACE\ollvm17-17.0.6-windows-x86_64.zip"
+          if (Test-Path $zip) { Remove-Item $zip -Force }
+          7z a -tzip -mx=5 "$zip" "$dst\*"
+          Write-Host "Zip created: $zip"
+          Get-Item "$zip" | Select-Object FullName,Length
+
+      # ---------------------------------------------------------------
+      # 10. Upload the artifact
+      # ---------------------------------------------------------------
+      - name: Upload toolchain artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ollvm17-17.0.6-windows-x86_64
+          path: ollvm17-17.0.6-windows-x86_64.zip
+          if-no-files-found: error
+          retention-days: 30
+
+  # -----------------------------------------------------------------
+  # How to use the artifact with Android Studio + NDK r26:
+  #   1. Download the zip from the workflow run, extract it.
+  #   2. In your NDK r26 install, back up and replace the binaries in:
+  #        <NDK>/toolchains/llvm/prebuilt/windows-x86_64/bin/
+  #      with clang.exe, clang++.exe, ld.lld, lld-link, etc. from the zip.
+  #      (NDK r26 ships clang 17.0.2; this 17.0.6 build is ABI-compatible
+  #       for cross-compiling to Android.)
+  #   3. Add obfuscation flags in your build.gradle(cmake/ndk) via
+  #      C/C++ -> Command Line, e.g.:
+  #        -mllvm -fla -mllvm -bcf -mllvm -bcf_prob=80 -mllvm -bcf_loop=3
+  #        -mllvm -sobf -mllvm -icall -mllvm -ibr -mllvm -igv
+  #        -mllvm -sub -mllvm -sub_loop=3 -mllvm -split -mllvm -split_num=5
+  #        -mllvm -mba -mllvm -alias -mllvm -junkcode -mllvm -bcf2 -mllvm -mergefunc
+  #        -mllvm -constenc -mllvm -aarch64-obfu
+  #   4. For per-function control use annotation:
+  #        __attribute__((annotate("fla bcf sub split mba linearmba aliasaccess junkcode boguscfg2 mergefunction"))) void f(){...}
+  #   5. For AArch64 backend obfuscation, add asm("backend-obfu") in the function body
+  # -----------------------------------------------------------------
