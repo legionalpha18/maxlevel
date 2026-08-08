@@ -30,6 +30,8 @@ bool FunctionWrapper::process(Module &M) {
       continue;
 
     std::string wrapperName = "__wrap_" + F->getName().str();
+    if (M.getFunction(wrapperName))
+      continue;
 
     std::vector<Type *> ParamTypes;
     for (Argument &Arg : F->args())
@@ -71,17 +73,17 @@ bool FunctionWrapper::process(Module &M) {
     else
       IRB.CreateRet(Result);
 
-    // Retarget direct call/invoke users to the wrapper while preserving EH edges.
-    std::vector<CallBase *> ToReplace;
+    // Rewrite only direct CallInst sites; invoke sites are left untouched.
+    std::vector<CallInst *> ToReplace;
     for (User *U : F->users()) {
-      if (CallBase *CB = dyn_cast<CallBase>(U)) {
-        if (CB->getParent()->getParent() != Wrapper)
-          ToReplace.push_back(CB);
+      if (CallInst *CI = dyn_cast<CallInst>(U)) {
+        if (CI->getCalledFunction() == F && CI->getParent()->getParent() != Wrapper)
+          ToReplace.push_back(CI);
       }
     }
 
-    for (CallBase *CB : ToReplace) {
-      CB->setCalledFunction(FunctionCallee(Wrapper));
+    for (CallInst *CI : ToReplace) {
+      CI->setCalledFunction(FunctionCallee(Wrapper));
     }
   }
 

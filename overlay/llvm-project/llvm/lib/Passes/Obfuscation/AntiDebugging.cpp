@@ -1,6 +1,6 @@
 #include "Obfuscation/AntiDebugging.h"
 #include "Obfuscation/Utils.h"
-#include "llvm/ADT/Triple.h"
+#include "llvm/TargetParser/Triple.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/GlobalVariable.h"
@@ -51,7 +51,7 @@ void AntiDebugging::process(Function &F) {
   // Declare ptrace — long ptrace(long request, long pid, void *addr, void *data)
   FunctionCallee PtraceF = M->getOrInsertFunction(
       "ptrace",
-      FunctionType::get(I64Ty, {I64Ty, I64Ty, PtrTy, PtrTy}, false));
+      FunctionType::get(I64Ty, {I32Ty, I32Ty, PtrTy, PtrTy}, false));
 
   IRBuilder<> IRB(InsertPt);
 
@@ -70,10 +70,10 @@ void AntiDebugging::process(Function &F) {
   // PtraceBB: call ptrace and mix result into guard
   IRB.SetInsertPoint(PtraceBB);
   IRB.CreateStore(ConstantInt::get(I32Ty, 1), adbDone, /*isVolatile=*/true);
-  Value *Zero64  = ConstantInt::get(I64Ty, 0);
+  Value *Zero32  = ConstantInt::get(I32Ty, 0);
   Value *NullPtr = ConstantPointerNull::get(PtrTy);
   // ptrace(PTRACE_TRACEME=0, 0, NULL, NULL) → 0 clean, -1 debugger attached
-  CallInst *PtraceRet = IRB.CreateCall(PtraceF, {Zero64, Zero64, NullPtr, NullPtr});
+  CallInst *PtraceRet = IRB.CreateCall(PtraceF, {Zero32, Zero32, NullPtr, NullPtr});
   PtraceRet->setCallingConv(CallingConv::C);
   Value *Ret32   = IRB.CreateTrunc(PtraceRet, I32Ty);
   LoadInst *Cur  = IRB.CreateLoad(I32Ty, adbGuard, /*isVolatile=*/true);
