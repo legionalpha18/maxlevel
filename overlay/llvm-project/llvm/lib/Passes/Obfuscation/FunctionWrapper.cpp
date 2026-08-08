@@ -26,6 +26,9 @@ bool FunctionWrapper::process(Module &M) {
   }
 
   for (Function *F : ToWrap) {
+    if (F->isVarArg())
+      continue;
+
     std::string wrapperName = "__wrap_" + F->getName().str();
 
     std::vector<Type *> ParamTypes;
@@ -60,31 +63,25 @@ bool FunctionWrapper::process(Module &M) {
     for (Argument &Arg : Wrapper->args())
       Args.push_back(&Arg);
 
-    Value *Result = IRB.CreateCall(FunctionCallee(F), Args);
+    CallInst *InnerCall = IRB.CreateCall(FunctionCallee(F), Args);
+    InnerCall->setCallingConv(F->getCallingConv());
+    Value *Result = InnerCall;
     if (F->getReturnType()->isVoidTy())
       IRB.CreateRetVoid();
     else
       IRB.CreateRet(Result);
 
-    // Replace all callers of original function with wrapper
-    // Skip calls from the wrapper itself
-    std::vector<CallInst *> ToReplace;
+    // Retarget direct call/invoke users to the wrapper while preserving EH edges.
+    std::vector<CallBase *> ToReplace;
     for (User *U : F->users()) {
-      if (CallInst *CI = dyn_cast<CallInst>(U)) {
-        if (CI->getParent()->getParent() != Wrapper)
-          ToReplace.push_back(CI);
+      if (CallBase *CB = dyn_cast<CallBase>(U)) {
+        if (CB->getParent()->getParent() != Wrapper)
+          ToReplace.push_back(CB);
       }
     }
 
-    for (CallInst *CI : ToReplace) {
-      std::vector<Value *> NewArgs;
-      for (unsigned i = 0; i < CI->arg_size(); i++)
-        NewArgs.push_back(CI->getArgOperand(i));
-
-      IRB.SetInsertPoint(CI);
-      CallInst *NewCall = IRB.CreateCall(FunctionCallee(Wrapper), NewArgs);
-      CI->replaceAllUsesWith(NewCall);
-      CI->eraseFromParent();
+    for (CallBase *CB : ToReplace) {
+      CB->setCalledFunction(FunctionCallee(Wrapper));
     }
   }
 

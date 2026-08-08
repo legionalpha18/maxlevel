@@ -1,5 +1,6 @@
 #include "Obfuscation/AntiDebugging.h"
 #include "Obfuscation/Utils.h"
+#include "llvm/ADT/Triple.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/GlobalVariable.h"
@@ -19,6 +20,10 @@ void AntiDebugging::process(Function &F) {
     return;
 
   Module *M = F.getParent();
+  Triple TT(M->getTargetTriple());
+  if (!TT.isOSLinux() && !TT.isAndroid())
+    return;
+
   LLVMContext &Ctx = M->getContext();
   BasicBlock &Entry = F.getEntryBlock();
   // splitBasicBlock needs at least one non-terminator instruction before InsertPt
